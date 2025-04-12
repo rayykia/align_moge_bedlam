@@ -20,9 +20,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
-# logging.basicConfig(level=logging.INFO)
-# logger = logging.getLogger("alignment")
-# logger.setLevel(logging.INFO)
 logger.info("Using device: {}".format(torch.cuda.get_device_name(0)
             if torch.cuda.is_available() else "cpu"))
 
