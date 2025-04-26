@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 import torch
 import cv2
 from BEDLAM.train.core.tester import Tester
+from BEDLAM.train.utils.renderer_pyrd import Renderer
+from BEDLAM.train.models.head.smplx_cam_head import SMPLXCamHead
+from BEDLAM.train.core.config import update_hparams
 from moge.utils.io import save_ply
 from moge.model.v1 import MoGeModel
 from PIL import Image
@@ -88,9 +91,10 @@ def run_moge_maps(image, device):
     point_map = output["points"].cpu().numpy()
     depth_map = output["depth"].cpu().numpy()
     mask = output["mask"].cpu().numpy()
+    inrinsics = output["intrinsics"].cpu().numpy()
     del moge_model
 
-    return point_map, depth_map, mask
+    return point_map, depth_map, mask, inrinsics
 
 
 def visualize_moge_maps(moge_points: np.array,
@@ -276,8 +280,36 @@ def smplx2mesh(hmr_output: dict, save=False) -> List:
     return meshes
 
 
+def project_vertices(vertices, focal_length, image_size,  pred_cam_t = None):
+    # N, V, _ = vertices.shape
+    try:
+        f_x, f_y = focal_length
+    except:
+        f_x = f_y = focal_length
+    img_H, img_W = image_size
+    
+    # apply translation
+    if pred_cam_t is not None:
+        verts_trans = vertices + pred_cam_t.unsqueeze(1)
+    else:
+        verts_trans = vertices
+    
+    # perspective division
+    verts_proj = verts_trans[..., :2] / np.clip(verts_trans[..., 2:], a_min=1e-5, a_max=None)
+    
+    # print(f'{f_x.shape =}')
+    # print(f'{img_W.shape = }')
+    verts_proj[..., 0] = verts_proj[..., 0] * f_x + img_W/ 2.0
+    verts_proj[..., 1] = verts_proj[..., 1] * f_y + img_H / 2.0
+
+    return verts_proj
+
+
 def scale_factor(depth_mean: np.array,
-                 hmr_meshes: List[trimesh.Trimesh]) -> float:
+                 hmr_meshes: List[trimesh.Trimesh],
+                 focal_length: float,
+                 imgsz: Tuple,
+                 masks: np.array) -> float:
     """Calculate the scale factor to align the meshes with the depth map.
 
     Args:
@@ -290,7 +322,7 @@ def scale_factor(depth_mean: np.array,
     z_unit = np.array([0, 0, 1])
 
     mesh_ref_depth = np.zeros_like(depth_mean)
-    for i, mesh in enumerate(hmr_meshes):
+    for i, (mesh, mask) in enumerate(zip(hmr_meshes, masks)):
         dot_product = np.dot(mesh.face_normals, z_unit)
         front_faces = np.where(dot_product < 0)[0]
 
@@ -298,7 +330,32 @@ def scale_factor(depth_mean: np.array,
 
         front_vertices = mesh.vertices[front_vertices_idx]
 
-        vertices_z = front_vertices[:, -1]
+        projected_vertices  =project_vertices(
+            front_vertices, focal_length, imgsz
+        )
+        u_raw = projected_vertices[:, 0]
+        v_raw = projected_vertices[:, 1]
+        H, W = mask.shape
+        inside_image_mask = (u_raw >= 0) & (u_raw < W) & (v_raw >= 0) & (v_raw < H)
+        u = u_raw.round().astype(int).clip(0, W-1)
+        v = v_raw.round().astype(int).clip(0, H-1)
+        mask_values = mask[v, u]
+        final_mask = inside_image_mask & (mask_values > 0)
+
+        visiable_veritices = front_vertices[final_mask]
+
+
+        # x = visiable_veritices[:, 0]
+        # y = visiable_veritices[:, 1]
+        # plt.figure(figsize=(8, 8))
+        # # plt.imshow(mask)
+        # plt.scatter(x, y, s=0.5)  # s is marker size
+        # plt.gca().invert_yaxis()  # Important: y-axis down like image coordinates
+        # plt.axis('equal')  # Keep aspect ratio
+        # plt.show()
+
+
+        vertices_z = visiable_veritices[:, -1]
         front_depth_mean = np.mean(vertices_z)
         mesh_ref_depth[i] = front_depth_mean
 
@@ -309,15 +366,24 @@ def scale_factor(depth_mean: np.array,
     if np.isnan(scale):
         logger.warning("Scale factor is NaN. Using default scale of 1.")
         scale = 1
-
     return scale
 
+
+def scale_env(hmr_output, focal_length, img, mask):
+    img_h = torch.tensor(height).cuda().float()
+    img_w = torch.tensor(width).cuda().float()
+    reprojected_vert = project_vertices(
+        hmr_smplx['vertices'], hmr_smplx['pred_cam_t'], (focal_length[0], focal_length[0]), (img_h[0], img_w[0])
+    )
+    pass
+    
 
 if __name__ == '__main__':
 
     input_dir = ['./data_drc']
     img = Image.open('./data_drc/big_bang.jpg').convert("RGB")
     img_arr = np.array(img)
+    height, width = img_arr.shape[:2]
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     detection = run_detector(input_dir)
@@ -327,7 +393,7 @@ if __name__ == '__main__':
 
     masks = run_sam(img, bboxes)
 
-    env_pts, env_depth, moge_mask = run_moge_maps(img, device)
+    env_pts, env_depth, moge_mask, intrinsics = run_moge_maps(img, device)
 
     visualize = False
     if visualize:
@@ -336,7 +402,7 @@ if __name__ == '__main__':
 
     vertices, faces, vertex_colors = points2mesh(
         img_arr, env_pts, env_depth, moge_mask)
-    mesh2ply('./ply/env/env.ply', vertices, faces, vertex_colors)
+    # mesh2ply('./ply/env/env.ply', vertices, faces, vertex_colors)
 
     depth_mean = []
     for i, mask in enumerate(masks):
@@ -347,13 +413,44 @@ if __name__ == '__main__':
 
     hmr_smplx = run_bedlam(detection)
 
+    for key, tensor in hmr_smplx.items():
+        print(f"{key}: {tensor.shape}")
+
+    img_h = torch.tensor(height).repeat(5).cuda().float()
+    img_w = torch.tensor(width).repeat(5).cuda().float()
+    focal_length = ((img_w * img_w + img_h * img_h) ** 0.5).cuda().float()
+    pred_vertices_array = (
+        (hmr_smplx['vertices'] + hmr_smplx['pred_cam_t'].unsqueeze(1)).detach().cpu().numpy()
+    )
+    smplx_cam_head = SMPLXCamHead(img_res = 224).to(device)
+    renderer = Renderer(
+        focal_length = focal_length[0],
+        img_w = img_w[0],
+        img_h = img_h[0],
+        faces = smplx_cam_head.smplx.faces,
+        same_mesh_color=False
+    )
+    front_view = renderer.render_front_view(
+        pred_vertices_array
+    )
+
+    # moge intrinsics estimation
+    f_x = (intrinsics[0, 0] * img_w[0]).cpu().numpy()
+    f_y = (intrinsics[1, 1] * img_h[0]).cpu().numpy()
+
+
     hmr_meshes = smplx2mesh(hmr_smplx, save=True)
     logger.info("BEDLAM SMPL-X meshes generated.")
 
-    scale_fac = scale_factor(depth_mean, hmr_meshes)
+    focal_length = focal_length.cpu().numpy()
+    img_h = img_h.cpu().numpy()
+    img_w = img_w.cpu().numpy()
+
+    # scale_fac = scale_factor(depth_mean, hmr_meshes, focal_length[0], (img_h[0], img_w[0]), masks)
+    scale_fac = scale_factor(depth_mean, hmr_meshes, (f_x, f_y), (img_h[0], img_w[0]), masks)
 
     mesh2ply(
-        './ply/env/env_scaled.ply',
+        './ply/env/env_rescaled.ply',
         vertices * scale_fac,
         faces,
         vertex_colors)
